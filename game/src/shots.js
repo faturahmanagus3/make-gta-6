@@ -1,79 +1,95 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// shots.js - deterministic screenshot scenes behind ?shot=<name>&seed=<n>.
+// Each scene stages the real game state (never a fake picture): the same
+// traffic, police, missions and HUD the player gets, arranged so one frame
+// shows as many systems as possible. The cover scene is the police chase.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { createCar } from './vehicles.js';
+import { forceWanted } from './police.js';
+import { spawnTireSmoke, spawnSparks } from './particles.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+export function readShotRequest(search) {
+  const params = new URLSearchParams(search || '');
+  const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
+  return { shot: params.get('shot'), seed: Number.isInteger(seedParam) ? seedParam : 7 };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function placeTraffic(state, spots) {
+  spots.forEach(([x, y, angle], i) => {
+    const car = state.traffic[i % state.traffic.length];
+    car.x = x; car.y = y; car.angle = angle; car.speed = 60; car.driver = 'traffic';
+  });
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+function beginMission(state, index, step) {
+  state.missions.index = index;
+  state.missions.step = step;
+  state.missions.active = true;
+  state.missions.done = false;
+  state.missions.started = true;
+  state.missions.banner = '';
+  state.missions.bannerTime = 0;
+  const defs = [
+    ['Mara: package is waiting in Palm Park.', 'Grab it, then drop it at the Old Port depot.'],
+    ['Mara: hit every checkpoint, Ria.', 'The PD is already rolling - keep moving.'],
+  ];
+  state.missions.dialogue = defs[Math.min(index, 1)];
+  state.missions.dialogueTime = 6.5;
+  if (index === 1) state.missions.timer = 0;
+}
+
+export function stageShot(state, name) {
+  if (name === 'title' || name === 'start') { state.mode = 'title'; return; }
+  state.mode = 'playing';
+  if (name === 'chase') {
+    // COVER: Ria in a stolen coupe on the Harbor Heights avenue, three stars,
+    // two cruisers on her tail, mission checkpoint ahead, minimap alive.
+    const car = createCar(820, 759, 0, '#e74c3c', 'civilian');
+    car.driver = 'player'; car.speed = 218; car.health = 72;
+    state.traffic.push(car); state.inCar = car;
+    state.player.x = car.x; state.player.y = car.y; state.player.health = 86;
+    const cop1 = createCar(690, 742, 0.08, '#f5f6fa', 'police'); cop1.driver = 'police'; cop1.speed = 226;
+    const cop2 = createCar(636, 792, -0.06, '#f5f6fa', 'police'); cop2.driver = 'police'; cop2.speed = 208;
+    state.police.cars = [cop1, cop2];
+    forceWanted(state.wanted, 3);
+    beginMission(state, 1, 0);
+    state.missions.step = 1; // checkpoint 2 at Harbor Heights, ahead of the car
+    placeTraffic(state, [[1060, 801, 0], [1210, 759, Math.PI], [700, 801, 0]]);
+    for (let i = 0; i < 8; i++) spawnTireSmoke(state.fx, car.x - 30 - i * 9, car.y + 12 + (i % 3) * 4);
+    spawnSparks(state.fx, cop1.x + 24, cop1.y - 8, 7);
+    state.cash = 570;
+    state.cam.x = car.x - 640; state.cam.y = car.y - 360;
+    state.focus = { x: car.x, y: car.y, angle: 0 };
+    state.district = 'Harbor Heights';
+  } else if (name === 'onfoot') {
+    // On foot in Palm Park: peds strolling, the package marker glowing nearby.
+    state.player.x = 585; state.player.y = 585; state.player.aimAngle = 0.5; state.player.angle = 0.5;
+    state.peds.slice(0, 7).forEach((ped, i) => {
+      ped.x = 600 + (i % 4) * 42; ped.y = 540 + Math.floor(i / 4) * 74; ped.down = 0; ped.fleeTime = 0;
+    });
+    placeTraffic(state, [[640, 461, 0], [900, 419, Math.PI]]);
+    beginMission(state, 0, 0);
+    state.cash = 120;
+    state.cam.x = state.player.x - 640; state.cam.y = state.player.y - 360;
+    state.focus = { x: state.player.x, y: state.player.y, angle: 0.5 };
+    state.district = 'Palm District';
+  } else if (name === 'mission') {
+    // Driving the delivery: package aboard, depot marker ahead, traffic around.
+    const car = createCar(905, 905, 0.5, '#3498db', 'civilian');
+    car.driver = 'player'; car.speed = 150; car.health = 92;
+    state.traffic.push(car); state.inCar = car;
+    state.player.x = car.x; state.player.y = car.y; state.player.health = 100;
+    beginMission(state, 0, 1);
+    placeTraffic(state, [[1120, 919, Math.PI], [760, 961, 0], [1000, 1120, -Math.PI / 2]]);
+    state.peds.slice(0, 4).forEach((ped, i) => { ped.x = 960 + i * 30; ped.y = 1005; });
+    state.cash = 420;
+    state.cam.x = car.x - 640; state.cam.y = car.y - 360;
+    state.focus = { x: car.x, y: car.y, angle: 0.5 };
+    state.district = 'Old Port';
+  } else {
+    state.player.x = 560; state.player.y = 560;
+    beginMission(state, 0, 0);
+    state.cam.x = 0; state.cam.y = 200;
+    state.focus = { x: 560, y: 560, angle: 0 };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
-  }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  window.__shotReady = true;
 }
